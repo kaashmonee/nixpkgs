@@ -1,0 +1,155 @@
+#!/usr/bin/env python3
+"""candctl — the three-word command surface for this machine's long-running work.
+
+Every user-facing invocation is at most three words ("candctl build sglang" style
+is already two). Internally the code is verbose on purpose: full names,
+explicit logging of what is about to run, where output goes, and why.
+
+Commands:
+    candctl build      start the sglang nixpkgs build in the background
+    candctl log        show the tail of the current build log
+    candctl status     report whether the build is running, done, or idle
+    candctl tts        start the sglang-omni text-to-speech server
+    candctl mirrors    synchronize all repository mirrors declared in the manifest
+    candctl engines    list the inference engines known to inferctl
+    candctl halogen    report whether the halogen container is running
+"""
+
+import logging
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)-7s %(message)s",
+    datefmt="%H:%M:%S",
+)
+logger = logging.getLogger("candctl")
+
+# ---------------------------------------------------------------------------
+# Locations, all in one place so they are greppable and easy to relocate.
+# ---------------------------------------------------------------------------
+HOME_DIRECTORY = Path.home()
+NIXPKGS_CHECKOUT_DIRECTORY = HOME_DIRECTORY / "nixpkgs-sglang"
+NIX_BINARY_DIRECTORY = "/nix/var/nix/profiles/default/bin"
+SG_LANG_BUILD_LOG_PATH = Path("/tmp/sglang-build.log")
+SG_LANG_BUILD_RESULT_PATH = NIXPKGS_CHECKOUT_DIRECTORY / "result"
+OMNI_SERVE_SCRIPT_PATH = Path("/tmp/omni-serve.sh")
+OMNI_SERVE_LOG_PATH = Path("/tmp/omni-serve.log")
+MIRROR_SYNC_EXECUTABLE_PATH = HOME_DIRECTORY / "bin" / "mirrorsync"
+INFERCTL_EXECUTABLE_PATH = HOME_DIRECTORY / "bin" / "inferctl"
+
+# The full nix invocation that compiles sglang and every new dependency.
+# cudaSupport is required because the kernel packages are CUDA extensions;
+# allowUnfree is required because flashinfer and friends are unfree fetches.
+SG_LANG_NIX_BUILD_COMMAND = (
+    f"cd {NIXPKGS_CHECKOUT_DIRECTORY} && "
+    f"PATH={NIX_BINARY_DIRECTORY}:$PATH "
+    f"nix-build -A python312Packages.sglang "
+    f"--arg config '{{cudaSupport=true;allowUnfree=true;}}' -L"
+)
+
+
+def execute_command(shell_command: str, run_in_background: bool = False) -> None:
+    """Run a shell command, logging exactly what is being executed.
+
+    Background runs are detached and their combined stdout+stderr is
+    redirected to the shared candctl log so nothing is silently lost.
+    """
+    logger.info("executing: %s", shell_command)
+    if run_in_background:
+        background_log_file = open(SG_LANG_BUILD_LOG_PATH, "w")
+        subprocess.Popen(
+            shell_command,
+            shell=True,
+            stdout=background_log_file,
+            stderr=subprocess.STDOUT,
+        )
+        logger.info("background process started; output at %s", SG_LANG_BUILD_LOG_PATH)
+        return
+    completed_process = subprocess.run(
+        shell_command, shell=True, capture_output=True, text=True
+    )
+    combined_output = (completed_process.stdout + completed_process.stderr).strip()
+    print(combined_output[:500] if combined_output else "(no output)")
+
+
+def command_build_sglang() -> None:
+    """candctl build — launch the full transitive nix build for python3Packages.sglang."""
+    logger.info("starting sglang build; log will be written to %s", SG_LANG_BUILD_LOG_PATH)
+    execute_command(f"{SG_LANG_NIX_BUILD_COMMAND} > {SG_LANG_BUILD_LOG_PATH} 2>&1", run_in_background=True)
+
+
+def command_show_build_log() -> None:
+    """candctl log — show the last few lines of the build log."""
+    if not SG_LANG_BUILD_LOG_PATH.exists():
+        logger.warning("no build log exists yet at %s; run 'candctl build' first", SG_LANG_BUILD_LOG_PATH)
+        return
+    execute_command(f"tail -5 {SG_LANG_BUILD_LOG_PATH}")
+
+
+def command_report_build_status() -> None:
+    """candctl status — is the nix build running, finished, or never started?"""
+    build_process = subprocess.run(
+        "pgrep -f '[n]ix-build.*sglang'", shell=True, capture_output=True, text=True
+    )
+    if build_process.returncode == 0:
+        logger.info("build processes found: %s", build_process.stdout.split())
+        print("running")
+    elif SG_LANG_BUILD_RESULT_PATH.exists():
+        print("done")
+    else:
+        print("idle")
+
+
+def command_start_tts_server() -> None:
+    """candctl tts — start the sglang-omni Qwen3-TTS server on port 8100."""
+    if not OMNI_SERVE_SCRIPT_PATH.exists():
+        logger.error("serve script missing at %s", OMNI_SERVE_SCRIPT_PATH)
+        return
+    subprocess.Popen(
+        f"setsid {OMNI_SERVE_SCRIPT_PATH} > {OMNI_SERVE_LOG_PATH} 2>&1 &", shell=True
+    )
+    logger.info("tts server launched; log at %s", OMNI_SERVE_LOG_PATH)
+
+
+def command_synchronize_mirrors() -> None:
+    """candctl mirrors — push every repository from primary to its declared mirror."""
+    execute_command(str(MIRROR_SYNC_EXECUTABLE_PATH))
+
+
+def command_list_engines() -> None:
+    """candctl engines — show the inference engine registry."""
+    execute_command(f"{INFERCTL_EXECUTABLE_PATH} engines")
+
+
+def command_check_halogen() -> None:
+    """candctl halogen — is the halogen container currently running?"""
+    execute_command("podman ps --format '{{.Names}}' | grep halogen || echo 'not running'")
+
+
+COMMAND_TABLE = {
+    "build": command_build_sglang,
+    "log": command_show_build_log,
+    "status": command_report_build_status,
+    "tts": command_start_tts_server,
+    "mirrors": command_synchronize_mirrors,
+    "engines": command_list_engines,
+    "halogen": command_check_halogen,
+}
+
+
+def main() -> None:
+    requested_command = sys.argv[1] if len(sys.argv) > 1 else "status"
+    handler = COMMAND_TABLE.get(requested_command)
+    if handler is None:
+        logger.error("unknown command %r", requested_command)
+        print(__doc__)
+        sys.exit(2)
+    handler()
+
+
+if __name__ == "__main__":
+    main()
